@@ -1,0 +1,6 @@
+{
+  "name": "NEXUS Spatial OS",
+  "description": "Futuristic spatial computing environment with 3D holographic interactive cards, MediaPipe hand gesture tracking, physics, and glassmorphic UI.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
