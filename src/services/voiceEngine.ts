@@ -3,172 +3,127 @@ import { useAiAssistantStore } from '../store/useAiAssistantStore';
 class VoiceEngine {
   private recognition: any = null;
   private isListening = false;
+  private restartTimer: number | null = null;
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private micStream: MediaStream | null = null;
   private animFrameId: number | null = null;
+  private lastRestart = 0;
 
   public init() {
-    if (typeof window === 'undefined') return;
-
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      console.warn('Web Speech Recognition API is not supported in this browser.');
-      return;
-    }
-
+    if (typeof window === 'undefined' || this.recognition) return;
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
     try {
       this.recognition = new SpeechRecognition();
       this.recognition.continuous = true;
       this.recognition.interimResults = true;
-      this.recognition.lang = 'en-US';
-
+      this.recognition.maxAlternatives = 1;
+      const locale = navigator.language || 'en-IN';
+      this.recognition.lang = locale.startsWith('bn') ? 'bn-IN' : locale.startsWith('hi') ? 'hi-IN' : 'en-IN';
       this.recognition.onstart = () => {
         this.isListening = true;
+        useAiAssistantStore.getState().setStatus('Listening');
       };
-
       this.recognition.onresult = (event: any) => {
         const store = useAiAssistantStore.getState();
-        let interimTranscript = '';
-        let finalTranscript = '';
-
+        let interim = '';
+        let finalText = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript;
-          } else {
-            interimTranscript += transcript;
-          }
+          const text = String(event.results[i][0]?.transcript || '').trim();
+          if (event.results[i].isFinal) finalText += ` ${text}`; else interim += ` ${text}`;
         }
-
-        const activeTranscript = (finalTranscript || interimTranscript).trim();
-
-        // 1. Wake Phrase Detection ("Nexus", "Hey Nexus")
+        const active = (finalText || interim).trim();
         if (!store.wakeState.isWoken) {
-          const lower = activeTranscript.toLowerCase();
-          if (lower.includes('nexus') || lower.includes('hey nexus') || lower.includes('computer')) {
+          const lower = active.toLowerCase();
+          const wake = /^(hey\s+)?(nexus|jarvis|computer)\b/i.exec(active);
+          if (wake) {
             store.wakeAssistant('VOICE');
-            const cleanPrompt = lower.replace(/^(hey\s+)?nexus\s*/i, '').trim();
-            if (cleanPrompt.length > 2) {
-              store.sendUserPrompt(cleanPrompt);
-            }
-            return;
+            const clean = active.slice(wake[0].length).trim();
+            if (clean.length > 1) void store.sendUserPrompt(clean);
+          } else if (finalText.trim().length > 1 && store.isMicEnabled) {
+            // Mic button is an explicit listen mode, so a wake word is not required.
+            void store.sendUserPrompt(finalText.trim());
           }
+          return;
         }
-
-        // 2. Interruption Detection
-        // If user speaks while AI is speaking, thinking, or streaming, immediately stop AI
-        if (store.status === 'Speaking' || store.status === 'Streaming' || store.status === 'Thinking') {
-          if (activeTranscript.length > 0) {
-            store.interrupt();
-          }
-        }
-
-        // 3. Active Transcription Display
-        if (store.wakeState.isWoken) {
-          store.setCurrentTranscript(interimTranscript || finalTranscript);
-
-          // 4. Send final recognized phrase to Gemini
-          if (finalTranscript.trim().length > 1) {
-            const promptToSend = finalTranscript.trim();
-            store.setCurrentTranscript('');
-            store.sendUserPrompt(promptToSend);
-          }
+        store.setCurrentTranscript(interim || finalText.trim());
+        if (finalText.trim().length > 1) {
+          const prompt = finalText.trim();
+          store.setCurrentTranscript('');
+          void store.sendUserPrompt(prompt);
         }
       };
-
       this.recognition.onerror = (event: any) => {
-        if (event.error !== 'no-speech') {
-          console.warn('Speech Recognition error:', event.error);
+        const error = event?.error;
+        if (error === 'not-allowed' || error === 'service-not-allowed') {
+          useAiAssistantStore.getState().setStatus('Offline');
+          return;
         }
+        if (error !== 'no-speech' && error !== 'aborted') console.warn('Speech recognition:', error);
       };
-
       this.recognition.onend = () => {
         this.isListening = false;
-        // Auto-restart continuous listening if mic is enabled
         const store = useAiAssistantStore.getState();
-        if (store.isMicEnabled || store.wakeState.isWoken) {
-          try {
-            this.recognition?.start();
-          } catch {
-            // Ignore start error if already active
-          }
+        if ((store.isMicEnabled || store.wakeState.isWoken) && Date.now() - this.lastRestart > 500) {
+          this.lastRestart = Date.now();
+          this.restartTimer = window.setTimeout(() => this.safeStart(), 250);
         }
       };
     } catch (e) {
-      console.warn('Failed to initialize SpeechRecognition:', e);
+      console.warn('SpeechRecognition init failed:', e);
     }
+  }
+
+  private safeStart() {
+    if (!this.recognition || this.isListening) return;
+    try { this.recognition.start(); } catch { /* browser may already be starting */ }
   }
 
   public async startMicrophone() {
-    if (!this.recognition) {
-      this.init();
-    }
-    try {
-      if (!this.isListening && this.recognition) {
-        this.recognition.start();
-      }
-      this.initAudioAnalyser();
-    } catch (e) {
-      // Ignore already started
-    }
+    if (!this.recognition) this.init();
+    this.safeStart();
+    this.initAudioAnalyser();
   }
 
   public stopMicrophone() {
-    try {
-      if (this.isListening && this.recognition) {
-        this.recognition.stop();
-      }
-      this.stopAudioAnalyser();
-    } catch {
-      // Ignore
-    }
+    if (this.restartTimer) window.clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+    try { this.recognition?.stop(); } catch {}
+    this.isListening = false;
+    this.stopAudioAnalyser();
   }
 
   private async initAudioAnalyser() {
-    if (this.analyser) return;
+    if (this.analyser || !navigator.mediaDevices?.getUserMedia) return;
     try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        const AudioCtx =
-          window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        this.audioContext = new AudioCtx();
-        const source = this.audioContext.createMediaStreamSource(this.micStream);
-        this.analyser = this.audioContext.createAnalyser();
-        this.analyser.fftSize = 32;
-        source.connect(this.analyser);
-
-        const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
-        const updateLevel = () => {
-          if (this.analyser) {
-            this.analyser.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-              sum += dataArray[i];
-            }
-            const avg = sum / (dataArray.length * 255);
-            useAiAssistantStore.getState().setAudioLevel(avg);
-          }
-          this.animFrameId = requestAnimationFrame(updateLevel);
-        };
-        updateLevel();
-      }
+      this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      this.audioContext = new AudioCtx();
+      const source = this.audioContext.createMediaStreamSource(this.micStream);
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 32;
+      source.connect(this.analyser);
+      const data = new Uint8Array(this.analyser.frequencyBinCount);
+      const update = () => {
+        if (!this.analyser) return;
+        this.analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (const value of data) sum += value;
+        useAiAssistantStore.getState().setAudioLevel(sum / (data.length * 255));
+        this.animFrameId = requestAnimationFrame(update);
+      };
+      update();
     } catch (e) {
-      console.warn('Microphone stream audio metering suppressed or permission denied:', e);
+      console.warn('Microphone metering unavailable:', e);
     }
   }
 
   private stopAudioAnalyser() {
-    if (this.animFrameId) {
-      cancelAnimationFrame(this.animFrameId);
-      this.animFrameId = null;
-    }
-    if (this.micStream) {
-      this.micStream.getTracks().forEach((t) => t.stop());
-      this.micStream = null;
-    }
+    if (this.animFrameId !== null) cancelAnimationFrame(this.animFrameId);
+    this.animFrameId = null;
+    this.micStream?.getTracks().forEach((track) => track.stop());
+    this.micStream = null;
     this.analyser = null;
   }
 }
