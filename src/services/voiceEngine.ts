@@ -1,4 +1,5 @@
 import { useAiAssistantStore } from '../store/useAiAssistantStore';
+import { dispatchDeviceCommand } from './commandGateway';
 
 class VoiceEngine {
   private recognition: any = null;
@@ -21,29 +22,23 @@ class VoiceEngine {
       this.recognition.maxAlternatives = 1;
       const locale = navigator.language || 'en-IN';
       this.recognition.lang = locale.startsWith('bn') ? 'bn-IN' : locale.startsWith('hi') ? 'hi-IN' : 'en-IN';
-      this.recognition.onstart = () => {
-        this.isListening = true;
-        useAiAssistantStore.getState().setStatus('Listening');
-      };
+      this.recognition.onstart = () => { this.isListening = true; useAiAssistantStore.getState().setStatus('Listening'); };
       this.recognition.onresult = (event: any) => {
         const store = useAiAssistantStore.getState();
-        let interim = '';
-        let finalText = '';
+        let interim = '', finalText = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const text = String(event.results[i][0]?.transcript || '').trim();
           if (event.results[i].isFinal) finalText += ` ${text}`; else interim += ` ${text}`;
         }
         const active = (finalText || interim).trim();
         if (!store.wakeState.isWoken) {
-          const lower = active.toLowerCase();
           const wake = /^(hey\s+)?(nexus|jarvis|computer)\b/i.exec(active);
           if (wake) {
             store.wakeAssistant('VOICE');
             const clean = active.slice(wake[0].length).trim();
-            if (clean.length > 1) void store.sendUserPrompt(clean);
+            if (clean.length > 1) void this.dispatchOrAi(clean);
           } else if (finalText.trim().length > 1 && store.isMicEnabled) {
-            // Mic button is an explicit listen mode, so a wake word is not required.
-            void store.sendUserPrompt(finalText.trim());
+            void this.dispatchOrAi(finalText.trim());
           }
           return;
         }
@@ -51,16 +46,13 @@ class VoiceEngine {
         if (finalText.trim().length > 1) {
           const prompt = finalText.trim();
           store.setCurrentTranscript('');
-          void store.sendUserPrompt(prompt);
+          void this.dispatchOrAi(prompt);
         }
       };
       this.recognition.onerror = (event: any) => {
         const error = event?.error;
-        if (error === 'not-allowed' || error === 'service-not-allowed') {
-          useAiAssistantStore.getState().setStatus('Offline');
-          return;
-        }
-        if (error !== 'no-speech' && error !== 'aborted') console.warn('Speech recognition:', error);
+        if (error === 'not-allowed' || error === 'service-not-allowed') useAiAssistantStore.getState().setStatus('Offline');
+        else if (error !== 'no-speech' && error !== 'aborted') console.warn('Speech recognition:', error);
       };
       this.recognition.onend = () => {
         this.isListening = false;
@@ -70,22 +62,19 @@ class VoiceEngine {
           this.restartTimer = window.setTimeout(() => this.safeStart(), 250);
         }
       };
-    } catch (e) {
-      console.warn('SpeechRecognition init failed:', e);
+    } catch (e) { console.warn('SpeechRecognition init failed:', e); }
+  }
+
+  private async dispatchOrAi(prompt: string) {
+    if (await dispatchDeviceCommand(prompt)) {
+      useAiAssistantStore.getState().setStatus('Listening');
+      return;
     }
+    void useAiAssistantStore.getState().sendUserPrompt(prompt);
   }
 
-  private safeStart() {
-    if (!this.recognition || this.isListening) return;
-    try { this.recognition.start(); } catch { /* browser may already be starting */ }
-  }
-
-  public async startMicrophone() {
-    if (!this.recognition) this.init();
-    this.safeStart();
-    this.initAudioAnalyser();
-  }
-
+  private safeStart() { if (!this.recognition || this.isListening) return; try { this.recognition.start(); } catch {} }
+  public async startMicrophone() { if (!this.recognition) this.init(); this.safeStart(); this.initAudioAnalyser(); }
   public stopMicrophone() {
     if (this.restartTimer) window.clearTimeout(this.restartTimer);
     this.restartTimer = null;
@@ -108,15 +97,12 @@ class VoiceEngine {
       const update = () => {
         if (!this.analyser) return;
         this.analyser.getByteFrequencyData(data);
-        let sum = 0;
-        for (const value of data) sum += value;
+        let sum = 0; for (const value of data) sum += value;
         useAiAssistantStore.getState().setAudioLevel(sum / (data.length * 255));
         this.animFrameId = requestAnimationFrame(update);
       };
       update();
-    } catch (e) {
-      console.warn('Microphone metering unavailable:', e);
-    }
+    } catch (e) { console.warn('Microphone metering unavailable:', e); }
   }
 
   private stopAudioAnalyser() {
